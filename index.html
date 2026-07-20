@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+ 現場向け 逐次音声翻訳プロトタイプ（日本語 ⇔ インドネシア語）
+ マスター（スタッフ）／スレーブ（実習生）遠隔操作型・単一HTMLファイル
+--------------------------------------------------------------------------------
+ 【セットアップ手順】
+ 1. Firebase コンソール (https://console.firebase.google.com) で無料プロジェクトを作成
+    - Realtime Database を「テストモード」で有効化（実運用前にルール要検討）
+    - プロジェクト設定 > マイアプリ > Web アプリ追加 → firebaseConfig を取得
+    - 下記 CONFIG.FIREBASE に貼り付け
+ 2. 同梱の code.gs を GAS にデプロイ（code.gs 冒頭のコメント参照）
+    - デプロイ URL を CONFIG.GAS_URL に貼り付け
+ 3. このファイルを HTTPS で配信（GitHub Pages / Netlify 等の無料ホスティング）
+    ※ Web Speech API / WakeLock は https:// 必須（localhost は可）
+ 4. ルームコードは推測されにくい文字列に変更して両端末で一致させること
+ 【動作要件】
+ - スレーブ端末: Android + Chrome を強く推奨（iOS Safari は音声認識の
+   自動再起動が不安定なためスレーブ用途には不適合）
+ - マスター端末: Chrome / Safari いずれも可
+================================================================================
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#101418">
+<title>現場翻訳 GENBA LINK</title>
+<style>
+  :root{
+    --bg:#101418;          /* 工場夜間照明のダークグレー */
+    --panel:#1a2027;
+    --line:#2c353f;
+    --ink:#e8edf2;
+    --ink-dim:#8b98a5;
+    --jp:#ffb020;          /* 日本語側: 安全標識イエロー */
+    --id:#39c0ba;          /* インドネシア語側: ティール */
+    --ok:#3ddc84;
+    --ng:#ff5252;
+    --warn:#ffb020;
+    --radius:14px;
+    --tap:64px;            /* 手袋作業前提の最小タップ寸法 */
+    font-size:16px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    background:var(--bg);color:var(--ink);
+    font-family:"Hiragino Sans","Noto Sans JP","Noto Sans",system-ui,sans-serif;
+    line-height:1.5;overscroll-behavior:none;
+  }
+  .screen{display:none;min-height:100dvh;flex-direction:column;padding:16px;gap:14px;max-width:560px;margin:0 auto}
+  .screen.active{display:flex}
+  h1{font-size:1.15rem;letter-spacing:.14em;font-weight:800}
+  h1 small{display:block;font-size:.68rem;color:var(--ink-dim);letter-spacing:.28em;font-weight:600}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+  label{display:block;font-size:.78rem;color:var(--ink-dim);margin-bottom:6px;letter-spacing:.06em}
+  input[type=text],select{
+    width:100%;min-height:52px;padding:10px 14px;border-radius:10px;
+    border:1px solid var(--line);background:#0c1013;color:var(--ink);font-size:1.05rem;
+  }
+  button{
+    min-height:var(--tap);border:none;border-radius:var(--radius);
+    font-size:1.05rem;font-weight:800;color:#0c1013;cursor:pointer;
+    letter-spacing:.04em;transition:filter .15s, transform .05s;
+  }
+  button:active{transform:scale(.985)}
+  button:disabled{filter:grayscale(.9) brightness(.55);cursor:not-allowed}
+  .btn-role{width:100%;background:var(--ink);margin-top:10px}
+  .row{display:flex;gap:10px;align-items:center}
+  .grow{flex:1}
+  /* ---- 接続ランプ ---- */
+  .lamp{width:14px;height:14px;border-radius:50%;background:var(--ng);flex:none;
+        box-shadow:0 0 8px var(--ng);transition:background .3s, box-shadow .3s}
+  .lamp.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .lamp-label{font-size:.72rem;color:var(--ink-dim)}
+  /* ---- マスター操作ボタン ---- */
+  .talk-btn{
+    width:100%;min-height:110px;display:flex;flex-direction:column;gap:4px;
+    align-items:center;justify-content:center;position:relative;
+  }
+  .talk-btn .sub{font-size:.72rem;font-weight:600;opacity:.75}
+  #btnJP{background:var(--jp)}
+  #btnID{background:var(--id)}
+  .talk-btn.rec{animation:pulse 1.1s ease-in-out infinite;outline:4px solid var(--ng)}
+  .talk-btn.wait{outline:4px dashed var(--ink-dim)}
+  @keyframes pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.35)}}
+  .status-line{min-height:1.4em;font-size:.86rem;color:var(--ink-dim);text-align:center}
+  /* ---- 履歴（最新数件のみ・DOM肥大化防止） ---- */
+  #history,#slaveHistory{display:flex;flex-direction:column;gap:10px}
+  .msg{border-left:4px solid var(--line);padding:8px 12px;background:var(--panel);border-radius:0 10px 10px 0}
+  .msg.ja{border-color:var(--jp)}
+  .msg.id{border-color:var(--id)}
+  .msg .src{font-size:.78rem;color:var(--ink-dim)}
+  .msg .dst{font-size:1.06rem;font-weight:700;margin-top:2px}
+  /* ---- スレーブ大型ステータス ---- */
+  #slaveBigStatus{
+    flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:12px;text-align:center;border-radius:var(--radius);
+    background:var(--panel);border:1px solid var(--line);padding:24px;min-height:220px;
+  }
+  #slaveBigStatus .icon{font-size:3.4rem}
+  #slaveBigStatus .txt{font-size:1.1rem;font-weight:800}
+  #slaveBigStatus .txt-id{font-size:.9rem;color:var(--ink-dim)}
+  #slaveBigStatus.listening{border-color:var(--ng);box-shadow:inset 0 0 40px rgba(255,82,82,.12)}
+  /* ---- 警告・致命的エラー ---- */
+  .warnbox{border:1px solid var(--warn);color:var(--warn);border-radius:10px;padding:10px 12px;font-size:.85rem;display:none}
+  .warnbox.show{display:block}
+  #fatalOverlay{
+    position:fixed;inset:0;background:rgba(8,10,12,.96);z-index:99;display:none;
+    flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:28px;text-align:center;
+  }
+  #fatalOverlay.show{display:flex}
+  #fatalOverlay .badge{font-size:3rem}
+  #fatalOverlay h2{color:var(--ng);font-size:1.25rem;letter-spacing:.08em}
+  #fatalOverlay p{color:var(--ink);font-size:1rem;max-width:420px}
+  #fatalOverlay .id-txt{color:var(--ink-dim)}
+  .foot{font-size:.68rem;color:var(--ink-dim);text-align:center;letter-spacing:.06em}
+  .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 10px;font-size:.7rem;color:var(--ink-dim)}
+  @media (prefers-reduced-motion: reduce){ .talk-btn.rec{animation:none} }
+</style>
+</head>
+<body>
+
+<!-- ================= 役割選択 ================= -->
+<section id="scrRole" class="screen active">
+  <h1>GENBA LINK<small>JP ⇔ ID VOICE BRIDGE — PROTOTYPE</small></h1>
+  <div class="card">
+    <label for="roomInput">ルームコード（両端末で同じ値 / 推測されにくい文字列に変更してください）</label>
+    <input type="text" id="roomInput" value="" placeholder="例: KANDA-7F-X3P9" autocomplete="off">
+    <button class="btn-role" id="btnMaster" style="background:var(--jp)">マスターとして開始（日本人スタッフ）</button>
+    <button class="btn-role" id="btnSlave" style="background:var(--id)">スレーブとして開始（実習生側・固定端末）</button>
+  </div>
+  <div class="warnbox show" id="cfgWarn" style="display:none"></div>
+  <p class="foot">スレーブ端末は Android + Chrome を推奨（iOS Safari は音声認識の自動再開が不安定）</p>
+</section>
+
+<!-- ================= マスター ================= -->
+<section id="scrMaster" class="screen">
+  <div class="row">
+    <h1 class="grow">マスター<small>STAFF CONSOLE</small></h1>
+    <div style="text-align:right">
+      <div class="row" style="justify-content:flex-end"><span class="lamp" id="lampMaster"></span></div>
+      <div class="lamp-label" id="lampMasterLabel">スレーブ未接続</div>
+    </div>
+  </div>
+
+  <button class="talk-btn" id="btnJP">
+    <span>自分が話す</span><span class="sub">日本語 → INDONESIA（タップで開始 / もう一度で送信）</span>
+  </button>
+  <button class="talk-btn" id="btnID">
+    <span>相手が話す</span><span class="sub">INDONESIA → 日本語（「以上です」の合図で終了タップ）</span>
+  </button>
+
+  <div class="status-line" id="masterStatus">待機中</div>
+  <div id="history"></div>
+
+  <!-- 伝わらなかった言葉の報告（辞書スプレッドシートに蓄積） -->
+  <div class="card" style="padding:12px">
+    <label for="reportInput">伝わらなかった言葉・誤訳された言葉を報告</label>
+    <div class="row">
+      <input type="text" id="reportInput" class="grow" placeholder="例: 型締め / 佐藤さん" autocomplete="off" style="min-height:44px">
+      <button id="btnReport" style="background:var(--ink);min-height:44px;min-width:74px;font-size:.9rem">報告</button>
+    </div>
+    <p class="foot" style="text-align:left;margin-top:6px">直前の翻訳内容も一緒に記録されます。管理者が辞書シートで訳を登録すると反映されます。</p>
+  </div>
+
+  <p class="foot"><span class="pill" id="roomBadgeM"></span></p>
+</section>
+
+<!-- ================= スレーブ: 初期設定 ================= -->
+<section id="scrSlaveSetup" class="screen">
+  <h1>スレーブ 初期設定<small>PENGATURAN AWAL</small></h1>
+  <div class="card">
+    <label for="micSelect">使用マイクの確認 / Periksa mikrofon</label>
+    <select id="micSelect"></select>
+    <p class="foot" style="text-align:left;margin-top:8px">
+      ※ 音声認識エンジンは OS が選択した入力を使用します。Bluetooth イヤホンを接続すると
+      OS 側で自動的に切り替わります。上の一覧は接続確認用です。
+    </p>
+  </div>
+  <div class="warnbox" id="voiceWarn">
+    ⚠ インドネシア語の音声データが見つかりません。端末の設定からダウンロードしてください。<br>
+    ⚠ Data suara Bahasa Indonesia tidak ditemukan. Silakan unduh dari Pengaturan perangkat.
+  </div>
+  <div class="warnbox" id="iosWarn">
+    ⚠ この端末は iOS の可能性があります。スレーブ用途では音声認識が途中停止する恐れがあるため、
+    Android + Chrome の端末を推奨します。
+  </div>
+  <button class="btn-role" id="btnReady" style="background:var(--id)">準備完了 / SIAP</button>
+  <p class="foot">タップ後はイヤホンを装着し、画面操作は不要です。<br>Setelah menekan tombol, pakai earphone. Tidak perlu menyentuh layar lagi.</p>
+</section>
+
+<!-- ================= スレーブ: 稼働中 ================= -->
+<section id="scrSlaveRun" class="screen">
+  <div class="row">
+    <h1 class="grow">スレーブ<small>TERHUBUNG / 稼働中</small></h1>
+    <div style="text-align:right">
+      <div class="row" style="justify-content:flex-end"><span class="lamp" id="lampSlave"></span></div>
+      <div class="lamp-label" id="lampSlaveLabel">マスター未接続</div>
+    </div>
+  </div>
+  <div id="slaveBigStatus">
+    <div class="icon" id="slaveIcon">🕒</div>
+    <div class="txt" id="slaveTxtJa">待機中 — スタッフの操作を待っています</div>
+    <div class="txt-id" id="slaveTxtId">Menunggu instruksi dari staf</div>
+  </div>
+  <div id="slaveHistory"></div>
+  <p class="foot"><span class="pill" id="roomBadgeS"></span></p>
+</section>
+
+<!-- ================= 致命的エラー（キルスイッチ） ================= -->
+<div id="fatalOverlay" role="alertdialog" aria-live="assertive">
+  <div class="badge">⛔</div>
+  <h2>SYSTEM STOPPED</h2>
+  <p>本日の無料枠上限に達したため、システムを停止しました。<br>時間をおいて再度お試しください。</p>
+  <p class="id-txt">Kuota harian telah habis. Sistem dihentikan.<br>Silakan coba lagi nanti.</p>
+  <p class="foot" id="fatalDetail"></p>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<script>
+"use strict";
+/* ============================================================
+ * 0. 設定（デプロイ時にここだけ書き換える）
+ * ============================================================ */
+const CONFIG = {
+  GAS_URL: "https://script.google.com/macros/s/AKfycbx2fy1UY5qG1cUfkIjZUXmWXgDxfJ9ZN5a5lEvIPpZDZASKLV5sb8YRhvGdNmaPbkyh/exec", // ← 設定済み
+  FIREBASE: {
+    // ▼▼▼ ここから4行、Firebaseコンソールの firebaseConfig の値に書き換える ▼▼▼
+    apiKey: "AIzaSyBwvwksaPXCHfj5d70MX-CkAnYpxNRBHvM",
+    authDomain: "factory-translate.firebaseapp.com",
+    databaseURL: "https://factory-translate-default-rtdb.firebaseio.com/",
+    projectId: "factory-translate",
+    // ▲▲▲ databaseURL はRealtime Database画面上部に表示される実物URLをコピーすること ▲▲▲
+  },
+  HEARTBEAT_MS: 3000,        // 死活監視の送信間隔
+  HEARTBEAT_STALE_MS: 8000,  // これを超えて更新が無ければ「切断」
+  ACK_TIMEOUT_MS: 5000,      // マイク起動ACK待ちの上限
+  DEBOUNCE_MS: 1000,         // 連打防止ロック
+  BEEP_VOLUME: 0.2,          // ★安全装置: 通知音は20%固定（変更禁止）
+  MAX_HISTORY: 3,            // 画面に残す履歴件数（DOM肥大化防止）
+  MIN_TEXT_LEN: 2,           // ノイズフィルタ: これ未満は破棄
+  RESUME_DELAY_MS: 100,      // 音声認識オートリジューム遅延
+  FETCH_TIMEOUT_MS: 20000,   // GAS応答待ちの上限
+  // ★セキュリティ: GASのsetup()実行時にログへ表示される合言葉をここに貼る
+  APP_SECRET: "35f608ac94b34536",
+  // ★ハンズフリー段階1: この言葉を検知したら自動で「終了タップ」と同じ処理を行う
+  //   （ボタンでの終了も引き続き使えます。誤検知時の保険）
+  END_KEYWORDS_JA: ["以上です", "翻訳して"],
+  END_KEYWORDS_ID: ["sekian", "sudah selesai", "selesai"],
+};
+
+/* ============================================================
+ * 1. カスタム辞書（LocalStorage・API通信スキップ用キャッシュ）
+ * ============================================================ */
+const DICT_KEY = "genba_dict_v1";
+const DEFAULT_DICT = [
+  { ja: "おはよう",       id: "Selamat pagi" },
+  { ja: "おはようございます", id: "Selamat pagi" },
+  { ja: "お疲れ様でした",   id: "Terima kasih atas kerja kerasnya" },
+  { ja: "ストップ",       id: "Stop! Berhenti!" },
+  { ja: "止めて",         id: "Stop! Berhenti!" },
+  { ja: "危ない",         id: "Awas! Bahaya!" },
+  { ja: "休憩です",       id: "Waktunya istirahat" },
+  { ja: "始めてください",   id: "Silakan mulai" },
+  { ja: "わかりました",     id: "Baik, saya mengerti" },
+  { ja: "もう一度お願いします", id: "Tolong ulangi sekali lagi" },
+];
+function loadDict(){
+  try{
+    const raw = localStorage.getItem(DICT_KEY);
+    if(raw) return JSON.parse(raw);
+  }catch(_){}
+  localStorage.setItem(DICT_KEY, JSON.stringify(DEFAULT_DICT));
+  return DEFAULT_DICT.slice();
+}
+const DICT = loadDict();
+const norm = s => (s||"").trim().toLowerCase()
+  .replace(/[。、．，,.!！?？\s]+/g,"")
+  .normalize("NFKC");
+function dictLookup(text, dir){ // dir: "ja-id" | "id-ja"
+  const n = norm(text);
+  if(!n) return null;
+  for(const e of DICT){
+    if(dir==="ja-id" && norm(e.ja)===n) return e.id;
+    if(dir==="id-ja" && norm(e.id)===n) return e.ja;
+  }
+  return null;
+}
+
+/* ============================================================
+ * 2. 共通ユーティリティ
+ * ============================================================ */
+const $ = id => document.getElementById(id);
+const showScreen = id => {
+  document.querySelectorAll(".screen").forEach(s=>s.classList.remove("active"));
+  $(id).classList.add("active");
+};
+let ROLE = null;      // "master" | "slave"
+let ROOM = null;
+let db = null, roomRef = null;
+let FATAL = false;
+
+/* ---- 致命的エラー: キルスイッチ ---- */
+function fatalStop(reason, broadcast){
+  if(FATAL) return;
+  FATAL = true;
+  try{ stopRecognition(true); }catch(_){}
+  try{ speechSynthesis.cancel(); }catch(_){}
+  document.querySelectorAll("button").forEach(b=>b.disabled=true);
+  $("fatalDetail").textContent = "code: " + reason;
+  $("fatalOverlay").classList.add("show");
+  if(broadcast && roomRef){
+    roomRef.child("fatal").set({reason, ts: Date.now()}).catch(()=>{});
+  }
+}
+
+/* ---- WakeLock（画面スリープ防止） ---- */
+let wakeLock = null;
+async function keepAwake(){
+  try{
+    if("wakeLock" in navigator){
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  }catch(_){/* 非対応端末は無視 */}
+}
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState==="visible" && !FATAL) keepAwake();
+});
+
+/* ---- 通知音（WebAudio・音量リミッター20%固定） ---- */
+let audioCtx = null;
+function ensureAudioCtx(){
+  if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  if(audioCtx.state==="suspended") audioCtx.resume().catch(()=>{});
+  return audioCtx;
+}
+function playBeep(){
+  try{
+    const ctx = ensureAudioCtx();
+    const gain = ctx.createGain();
+    // ★労災防止: プログラム側で強制的に 20% を上限とする
+    gain.gain.value = Math.min(CONFIG.BEEP_VOLUME, 0.2);
+    gain.connect(ctx.destination);
+    const t = ctx.currentTime;
+    [[880,0],[1320,0.09]].forEach(([f,off])=>{
+      const o = ctx.createOscillator();
+      o.type="sine"; o.frequency.value=f;
+      o.connect(gain); o.start(t+off); o.stop(t+off+0.08);
+    });
+  }catch(_){}
+}
+
+/* ---- 無音オーディオ無限ループ（iOS Autoplayブロック回避ハック） ---- */
+let silentAudio = null;
+function startSilentLoop(){
+  try{
+    silentAudio = new Audio(
+      "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA");
+    silentAudio.loop = true;
+    silentAudio.volume = 0.01;
+    silentAudio.play().catch(()=>{});
+  }catch(_){}
+}
+
+/* ---- TTSキュー（直列再生・上書き防止）＋ 半二重ロック ---- */
+const ttsQueue = [];
+let ttsSpeaking = false;
+function enqueueTTS(text, lang){
+  ttsQueue.push({text, lang});
+  pumpTTS();
+}
+function pumpTTS(){
+  if(ttsSpeaking || ttsQueue.length===0 || FATAL) return;
+  const {text, lang} = ttsQueue.shift();
+  ttsSpeaking = true;
+  halfDuplexMute(true);   // ★ハウリング防止: 再生中はマイク停止
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = lang;
+  const v = pickVoice(lang);
+  if(v) u.voice = v;
+  u.onend = u.onerror = ()=>{
+    ttsSpeaking = false;
+    halfDuplexMute(false);
+    setTimeout(pumpTTS, 150);
+  };
+  speechSynthesis.speak(u);
+}
+let cachedVoices = [];
+function refreshVoices(){ cachedVoices = speechSynthesis.getVoices() || []; }
+if("speechSynthesis" in window){
+  refreshVoices();
+  speechSynthesis.onvoiceschanged = refreshVoices;
+}
+function pickVoice(lang){
+  const p = lang.slice(0,2).toLowerCase();
+  return cachedVoices.find(v=>v.lang && v.lang.toLowerCase().startsWith(p)) || null;
+}
+
+/* ============================================================
+ * 3. 音声認識（バッファリング + オートリジューム + ノイズフィルタ）
+ * ============================================================ */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recog = null;
+let recogActive = false;   // 「録音セッション中」フラグ（STOP指示が出るまでtrue）
+let recogLang = "ja-JP";
+let buffer = [];           // isFinal ごとに溜める（細切れ翻訳防止）
+let mutedByTTS = false;
+let endKeywordHandler = null;   // ★段階1: 終了キーワード検知時に呼ばれる処理
+
+function detectEndKeyword(text, lang){
+  const n = (text||"").toLowerCase().replace(/[。、．，,.!！?？\s]+/g,"");
+  const kws = lang.startsWith("ja") ? CONFIG.END_KEYWORDS_JA : CONFIG.END_KEYWORDS_ID;
+  for(const k of kws){
+    const kn = k.toLowerCase().replace(/\s+/g,"");
+    if(kn && n.includes(kn)) return k;
+  }
+  return null;
+}
+function stripEndKeywords(text, lang){
+  let out = text || "";
+  const kws = lang.startsWith("ja") ? CONFIG.END_KEYWORDS_JA : CONFIG.END_KEYWORDS_ID;
+  for(const k of kws){
+    out = out.split(k).join(" ");
+    // 音声認識はスペース有無が揺れるため、スペース除去版でも置換
+    const noSpace = k.replace(/\s+/g,"");
+    if(noSpace !== k) out = out.split(noSpace).join(" ");
+  }
+  return out.replace(/\s+/g," ").trim();
+}
+
+function startRecognition(lang, onStarted){
+  if(!SR){ alert("この端末は音声認識(Web Speech API)に対応していません。"); return false; }
+  stopRecognition(true);
+  recogLang = lang;
+  buffer = [];
+  recogActive = true;
+  spawnRecognizer(onStarted);
+  return true;
+}
+function spawnRecognizer(onStarted){
+  recog = new SR();
+  recog.lang = recogLang;
+  recog.continuous = true;
+  recog.interimResults = false;
+  recog.onstart = ()=>{ if(onStarted){ onStarted(); onStarted=null; } };
+  recog.onresult = ev=>{
+    if(mutedByTTS) return; // 半二重: TTS中に拾った自声は破棄
+    for(let i=ev.resultIndex;i<ev.results.length;i++){
+      if(ev.results[i].isFinal){
+        const t = (ev.results[i][0].transcript||"").trim();
+        if(t.replace(/\s/g,"").length >= CONFIG.MIN_TEXT_LEN) buffer.push(t); // ノイズ破棄
+        // ★段階1ハンズフリー: 終了キーワードを検知したら自動終了
+        if(endKeywordHandler && detectEndKeyword(t, recogLang)){
+          const h = endKeywordHandler; endKeywordHandler = null;
+          h();
+        }
+      }
+    }
+  };
+  recog.onend = ()=>{
+    // ★オートリジューム: マスターからOFF指示が無い限り0.1秒で自動再起動
+    if(recogActive && !FATAL && !mutedByTTS){
+      setTimeout(()=>{ if(recogActive && !mutedByTTS) spawnRecognizer(null); }, CONFIG.RESUME_DELAY_MS);
+    }
+  };
+  recog.onerror = e=>{
+    if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+      recogActive = false;
+      alert("マイクの使用が許可されていません。ブラウザ設定を確認してください。");
+    }
+    // "no-speech" 等は onend 経由で自動再起動
+  };
+  try{ recog.start(); }catch(_){}
+}
+function stopRecognition(discard){
+  recogActive = false;
+  endKeywordHandler = null;
+  if(recog){ try{ recog.onend=null; recog.stop(); }catch(_){} recog=null; }
+  if(discard) buffer = [];
+}
+function halfDuplexMute(on){
+  mutedByTTS = on;
+  if(on){
+    if(recog){ try{ recog.onend=null; recog.abort(); }catch(_){} recog=null; }
+  }else if(recogActive && !FATAL){
+    setTimeout(()=>{ if(recogActive && !mutedByTTS) spawnRecognizer(null); }, CONFIG.RESUME_DELAY_MS);
+  }
+}
+
+/* ============================================================
+ * 4. 翻訳（辞書キャッシュ → GAS/Gemini プロキシ）
+ * ============================================================ */
+async function translate(text, dir){
+  const hit = dictLookup(text, dir);
+  if(hit) return {translated: hit, cached: true};
+  const ctl = new AbortController();
+  const timer = setTimeout(()=>ctl.abort(), CONFIG.FETCH_TIMEOUT_MS);
+  let res;
+  try{
+    res = await fetch(CONFIG.GAS_URL, {
+      method: "POST",
+      headers: {"Content-Type":"text/plain;charset=utf-8"}, // ← CORSプリフライト回避（GAS仕様）
+      body: JSON.stringify({action:"translate", secret: CONFIG.APP_SECRET, text, dir}),
+      signal: ctl.signal,
+    });
+  }catch(e){
+    clearTimeout(timer);
+    throw new Error(e.name==="AbortError" ? "TIMEOUT" : "NETWORK");
+  }
+  clearTimeout(timer);
+  if(res.status===429){ fatalStop("HTTP_429", true); throw new Error("QUOTA"); }
+  let data;
+  try{ data = await res.json(); }catch(_){ throw new Error("BAD_RESPONSE"); }
+  if(data.error){
+    if(data.error==="QUOTA"){ fatalStop("GEMINI_QUOTA", true); }
+    if(data.error==="RATE_LIMIT") throw new Error("混雑中です。30秒ほど待って再試行してください");
+    if(data.error==="FORBIDDEN") throw new Error("合言葉不一致: CONFIG.APP_SECRET を確認");
+    throw new Error(data.error);
+  }
+  return {translated: (data.translated||"").trim(), cached: false};
+}
+
+/* ---- 伝わらなかった言葉の報告（スプレッドシートへ蓄積） ---- */
+async function sendReport(word){
+  const last = window.__lastResult || {};
+  const res = await fetch(CONFIG.GAS_URL, {
+    method: "POST",
+    headers: {"Content-Type":"text/plain;charset=utf-8"},
+    body: JSON.stringify({
+      action: "report", secret: CONFIG.APP_SECRET,
+      word: word,
+      lastSrc: last.src || "", lastDst: last.dst || "", lastDir: last.dir || "",
+    }),
+  });
+  const data = await res.json();
+  if(data.error) throw new Error(data.error);
+  return true;
+}
+
+/* ============================================================
+ * 5. 履歴表示（最新 MAX_HISTORY 件のみ・古いDOMは削除）
+ * ============================================================ */
+function pushHistory(containerId, dir, src, dst){
+  const box = $(containerId);
+  const div = document.createElement("div");
+  div.className = "msg " + (dir==="ja-id" ? "ja" : "id");
+  const s = document.createElement("div"); s.className="src"; s.textContent = src;
+  const d = document.createElement("div"); d.className="dst"; d.textContent = dst;
+  div.append(s,d);
+  box.prepend(div);
+  while(box.children.length > CONFIG.MAX_HISTORY) box.lastChild.remove();
+}
+
+/* ============================================================
+ * 6. Firebase 同期（cmd / ack / result / hb / fatal）
+ * ============================================================ */
+let seq = 0;
+let hbTimer = null, hbWatch = null;
+function initFirebase(){
+  firebase.initializeApp(CONFIG.FIREBASE);
+  db = firebase.database();
+  roomRef = db.ref("rooms/" + ROOM);
+  roomRef.child("fatal").on("value", snap=>{
+    const v = snap.val();
+    if(v && v.reason) fatalStop("REMOTE:"+v.reason, false);
+  });
+}
+function startHeartbeat(myRole, otherRole, lampId, labelId, connectedLabel, lostLabel){
+  const my = roomRef.child("hb/"+myRole);
+  hbTimer = setInterval(()=>{ if(!FATAL) my.set(Date.now()).catch(()=>{}); }, CONFIG.HEARTBEAT_MS);
+  my.set(Date.now()).catch(()=>{});
+  let lastSeen = 0;
+  roomRef.child("hb/"+otherRole).on("value", s=>{ lastSeen = s.val()||0; });
+  hbWatch = setInterval(()=>{
+    const ok = (Date.now() - lastSeen) < CONFIG.HEARTBEAT_STALE_MS;
+    $(lampId).classList.toggle("ok", ok);
+    $(labelId).textContent = ok ? connectedLabel : lostLabel;
+  }, 1000);
+}
+
+/* ============================================================
+ * 7. マスター側ロジック
+ * ============================================================ */
+const M = { state:"idle", dir:null, lock:false, ackTimer:null };
+
+function mSetStatus(t){ $("masterStatus").textContent = t; }
+function mLockButtons(){ // デバウンス: 1秒間タップ無効
+  M.lock = true;
+  setTimeout(()=>{ M.lock = false; }, CONFIG.DEBOUNCE_MS);
+}
+function mUpdateButtons(){
+  const bJP = $("btnJP"), bID = $("btnID");
+  bJP.classList.toggle("rec",  M.state==="recording" && M.dir==="ja-id");
+  bID.classList.toggle("rec",  M.state==="recording" && M.dir==="id-ja");
+  bID.classList.toggle("wait", M.state==="waitAck");
+  bJP.disabled = FATAL || (M.state!=="idle" && M.dir!=="ja-id");
+  bID.disabled = FATAL || (M.state!=="idle" && M.dir!=="id-ja");
+}
+
+function initMaster(){
+  showScreen("scrMaster");
+  $("roomBadgeM").textContent = "ROOM: " + ROOM;
+  keepAwake();
+  startHeartbeat("master","slave","lampMaster","lampMasterLabel","スレーブ接続中","スレーブ未接続");
+
+  // スレーブからのACK受信
+  roomRef.child("ack").on("value", snap=>{
+    const a = snap.val();
+    if(!a || a.seq!==seq || M.state!=="waitAck") return;
+    clearTimeout(M.ackTimer);
+    if(a.ok){
+      M.state = "recording";
+      mSetStatus("● 録音中（相手が話しています）— 終了タップで翻訳します");
+    }else{
+      M.state = "idle"; M.dir = null;
+      mSetStatus("⚠ スレーブ側マイク起動に失敗しました");
+    }
+    mUpdateButtons();
+  });
+
+  // 翻訳結果の共有受信（自分発・相手発どちらも表示）
+  roomRef.child("result").on("value", snap=>{
+    const r = snap.val();
+    if(!r || !r.dst) return;
+    window.__lastResult = r; // 報告フォーム用に直前の結果を保持
+    pushHistory("history", r.dir, r.src, r.dst);
+    if(r.dir==="id-ja") enqueueTTS(r.dst, "ja-JP"); // 相手の発話→日本語をマスターで読み上げ
+  });
+
+  // ★段階1: スレーブが終了キーワードで自動終了した通知を受けてUIを同期
+  roomRef.child("autostop").on("value", snap=>{
+    const a = snap.val();
+    if(!a) return;
+    if(M.state==="recording" && M.dir==="id-ja"){
+      M.state="translating"; mUpdateButtons();
+      mSetStatus("… 翻訳中（相手の「終了の合図」を検知）");
+      setTimeout(()=>{ if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); } }, 4000);
+    }
+  });
+
+  // 伝わらなかった言葉の報告フォーム
+  $("btnReport").addEventListener("click", async ()=>{
+    const w = ($("reportInput").value||"").trim();
+    if(!w){ mSetStatus("報告する言葉を入力してください"); return; }
+    $("btnReport").disabled = true;
+    try{
+      await sendReport(w);
+      $("reportInput").value = "";
+      mSetStatus("✓ 報告しました（辞書シートに追加されます）");
+    }catch(e){
+      mSetStatus("⚠ 報告に失敗（"+e.message+"）");
+    }
+    $("btnReport").disabled = false;
+  });
+
+  $("btnJP").addEventListener("click", ()=>{
+    if(M.lock || FATAL) return; mLockButtons();
+    if(M.state==="idle"){
+      ensureAudioCtx();
+      M.state="recording"; M.dir="ja-id"; mUpdateButtons();
+      startRecognition("ja-JP", ()=>{ playBeep(); mSetStatus("● 録音中（日本語）—「以上です」またはタップで送信"); });
+      // ★段階1: 「以上です」で自動送信
+      endKeywordHandler = ()=>{ if(M.state==="recording" && M.dir==="ja-id") finishLocalRecording(); };
+    }else if(M.state==="recording" && M.dir==="ja-id"){
+      finishLocalRecording();
+    }
+  });
+
+  $("btnID").addEventListener("click", ()=>{
+    if(M.lock || FATAL) return; mLockButtons();
+    ensureAudioCtx();
+    if(M.state==="idle"){
+      // ★ACK制御: 即「録音中」にせず、スレーブのマイク起動成功を待つ
+      M.state="waitAck"; M.dir="id-ja"; mUpdateButtons();
+      mSetStatus("… スレーブ側マイクを起動中");
+      seq++;
+      roomRef.child("cmd").set({seq, type:"START", dir:"id-ja", ts:Date.now()});
+      M.ackTimer = setTimeout(()=>{
+        if(M.state==="waitAck"){
+          M.state="idle"; M.dir=null; mUpdateButtons();
+          mSetStatus("⚠ 応答なし: スレーブ端末の状態を確認してください");
+        }
+      }, CONFIG.ACK_TIMEOUT_MS);
+    }else if(M.state==="recording" && M.dir==="id-ja"){
+      M.state="translating"; mUpdateButtons();
+      mSetStatus("… 翻訳中");
+      seq++;
+      roomRef.child("cmd").set({seq, type:"STOP", dir:"id-ja", ts:Date.now()});
+      // 翻訳完了は result 受信で反映。一定時間後にidleへ復帰。
+      setTimeout(()=>{ if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); } }, 1500);
+      // 状態遷移は result 受信でも解除する
+      const off = roomRef.child("result").on("value", ()=>{ 
+        if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); }
+        roomRef.child("result").off("value", off);
+      });
+    }
+  });
+}
+
+async function finishLocalRecording(){
+  // ★細切れ翻訳防止: OFFの瞬間にバッファをひとまとめで送信
+  stopRecognition(false);
+  const text = stripEndKeywords(buffer.join(" ").trim(), "ja"); // 「以上です」等は除去
+  buffer = [];
+  M.state="translating"; M.dir=null; mUpdateButtons();
+  if(text.replace(/\s/g,"").length < CONFIG.MIN_TEXT_LEN){
+    M.state="idle"; mUpdateButtons(); mSetStatus("（音声が短すぎるため破棄しました）");
+    return;
+  }
+  mSetStatus("… 翻訳中");
+  try{
+    const {translated} = await translate(text, "ja-id");
+    await roomRef.child("result").set({dir:"ja-id", src:text, dst:translated, ts:Date.now()});
+    mSetStatus("送信済み");
+  }catch(e){
+    if(!FATAL) mSetStatus("⚠ 翻訳に失敗しました（"+e.message+"）— もう一度お試しください");
+  }
+  M.state="idle"; mUpdateButtons();
+}
+
+/* ============================================================
+ * 8. スレーブ側ロジック
+ * ============================================================ */
+function slaveStatus(icon, ja, id, listening){
+  $("slaveIcon").textContent = icon;
+  $("slaveTxtJa").textContent = ja;
+  $("slaveTxtId").textContent = id;
+  $("slaveBigStatus").classList.toggle("listening", !!listening);
+}
+
+async function initSlaveSetup(){
+  showScreen("scrSlaveSetup");
+  // iOS 警告
+  if(/iPad|iPhone|iPod/.test(navigator.userAgent)) $("iosWarn").classList.add("show");
+  // マイク権限取得 → デバイス一覧（確認用プルダウン）
+  try{
+    const st = await navigator.mediaDevices.getUserMedia({audio:true});
+    st.getTracks().forEach(t=>t.stop());
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const sel = $("micSelect");
+    sel.innerHTML = "";
+    devs.filter(d=>d.kind==="audioinput").forEach(d=>{
+      const o = document.createElement("option");
+      o.value = d.deviceId;
+      o.textContent = d.label || "マイク ("+d.deviceId.slice(0,6)+")";
+      sel.appendChild(o);
+    });
+  }catch(_){
+    alert("マイクの使用を許可してください。/ Izinkan penggunaan mikrofon.");
+  }
+  // インドネシア語TTS音声データ欠損チェック（非同期ロード対応）
+  const check = ()=>{
+    refreshVoices();
+    const has = cachedVoices.some(v=>v.lang && v.lang.toLowerCase().startsWith("id"));
+    $("voiceWarn").classList.toggle("show", !has);
+  };
+  check();
+  setTimeout(check, 1500);
+
+  $("btnReady").addEventListener("click", async ()=>{
+    ensureAudioCtx();
+    startSilentLoop();      // ★Autoplayブロック回避: 準備完了タップ直後から無音ループ
+    playBeep();             // ユーザー操作起点でオーディオ経路を確立
+    await keepAwake();
+    // 選択デバイスで keep-alive ストリームを保持（OSの入力ルーティングを誘導）
+    try{
+      const id = $("micSelect").value;
+      if(id) await navigator.mediaDevices.getUserMedia({audio:{deviceId:{exact:id}}});
+    }catch(_){}
+    initSlaveRun();
+  }, {once:true});
+}
+
+function initSlaveRun(){
+  showScreen("scrSlaveRun");
+  $("roomBadgeS").textContent = "ROOM: " + ROOM;
+  startHeartbeat("slave","master","lampSlave","lampSlaveLabel","マスター接続中","マスター未接続");
+
+  // マスターからの指令
+  let handledSeq = 0;
+  roomRef.child("cmd").on("value", async snap=>{
+    const c = snap.val();
+    if(!c || c.seq<=handledSeq || FATAL) return;
+    handledSeq = c.seq;
+    if(c.type==="START" && c.dir==="id-ja"){
+      const ok = startRecognition("id-ID", ()=>{
+        // ★ACK: マイク起動成功をマスターへ通知 → 直後に合図音（20%）
+        roomRef.child("ack").set({seq:c.seq, ok:true, ts:Date.now()});
+        playBeep();
+        slaveStatus("🎙", "どうぞ話してください（終わったら sekian）", "Silakan bicara. Akhiri dengan: sekian", true);
+      });
+      if(ok){
+        // ★段階1: 「sekian」等を検知したら自動終了（マスターにも通知）
+        endKeywordHandler = ()=>{
+          roomRef.child("autostop").set({ts: Date.now()});
+          slaveFinishAndTranslate();
+        };
+      }else{
+        roomRef.child("ack").set({seq:c.seq, ok:false, ts:Date.now()});
+      }
+    }
+    if(c.type==="STOP" && c.dir==="id-ja"){
+      slaveFinishAndTranslate();
+    }
+  });
+
+  async function slaveFinishAndTranslate(){
+    stopRecognition(false);
+    const text = stripEndKeywords(buffer.join(" ").trim(), "id"); // sekian等は除去
+    buffer = [];
+    slaveStatus("⏳", "翻訳中…", "Sedang menerjemahkan…", false);
+    if(text.replace(/\s/g,"").length < CONFIG.MIN_TEXT_LEN){
+      slaveStatus("🕒", "待機中", "Menunggu", false);
+      roomRef.child("result").set({dir:"id-ja", src:text||"(無音)", dst:"（音声を検出できませんでした）", ts:Date.now()});
+      return;
+    }
+    try{
+      const {translated} = await translate(text, "id-ja");
+      await roomRef.child("result").set({dir:"id-ja", src:text, dst:translated, ts:Date.now()});
+    }catch(e){
+      if(!FATAL) roomRef.child("result").set({dir:"id-ja", src:text, dst:"（翻訳エラー: "+e.message+"）", ts:Date.now()});
+    }
+    slaveStatus("🕒", "待機中", "Menunggu", false);
+  }
+
+  // 翻訳結果: 日本語→インドネシア語はスレーブのイヤホンで読み上げ
+  roomRef.child("result").on("value", snap=>{
+    const r = snap.val();
+    if(!r || !r.dst) return;
+    pushHistory("slaveHistory", r.dir, r.src, r.dst);
+    if(r.dir==="ja-id"){
+      slaveStatus("🔊", "スタッフからのメッセージ", "Pesan dari staf", false);
+      enqueueTTS(r.dst, "id-ID"); // TTSキュー: 直列再生（半二重ロック内蔵）
+      setTimeout(()=>{ if(!recogActive) slaveStatus("🕒","待機中","Menunggu",false); }, 800);
+    }
+  });
+  slaveStatus("🕒", "待機中 — スタッフの操作を待っています", "Menunggu instruksi dari staf", false);
+}
+
+/* ============================================================
+ * 9. 起動
+ * ============================================================ */
+(function boot(){
+  const missing = [];
+  if(CONFIG.GAS_URL.includes("XXXX")) missing.push("GAS_URL");
+  if(CONFIG.FIREBASE.apiKey.startsWith("YOUR_")) missing.push("FIREBASE設定");
+  if(missing.length){
+    const w = $("cfgWarn");
+    w.style.display="block";
+    w.textContent = "⚠ 未設定: " + missing.join(" / ") + " — HTMLファイル冒頭の CONFIG を編集してください。";
+  }
+  $("roomInput").value = localStorage.getItem("genba_room") || "";
+  const start = role=>{
+    const room = ($("roomInput").value||"").trim().replace(/[.#$\[\]\/\s]/g,"-");
+    if(!room){ alert("ルームコードを入力してください"); return; }
+    localStorage.setItem("genba_room", room);
+    ROLE = role; ROOM = room;
+    try{ initFirebase(); }catch(e){ alert("Firebase初期化に失敗: CONFIG を確認してください"); return; }
+    keepAwake();
+    if(role==="master") initMaster(); else initSlaveSetup();
+  };
+  $("btnMaster").addEventListener("click", ()=>start("master"));
+  $("btnSlave").addEventListener("click", ()=>start("slave"));
+})();
+</script>
+</body>
+</html>
