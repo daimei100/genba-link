@@ -181,6 +181,15 @@
     padding:3px 12px;font-size:.7rem;color:var(--ink-dim);
     background:linear-gradient(165deg, var(--card-hi), var(--card-lo));
   }
+  .meter{
+    height:14px;border-radius:999px;border:1px solid var(--line-strong);
+    background:rgba(9,13,20,.7);overflow:hidden;
+  }
+  #micLevelBar{
+    height:100%;width:0%;border-radius:999px;
+    background:linear-gradient(90deg,var(--id),var(--jp-hi));
+    transition:width .08s linear;
+  }
   @media (prefers-reduced-motion: reduce){ .talk-btn.rec{animation:none} }
 </style>
 </head>
@@ -241,9 +250,11 @@
   <div class="card">
     <label for="micSelect">使用マイクの確認 / Periksa mikrofon</label>
     <select id="micSelect"></select>
+    <label style="margin-top:12px">マイク入力レベル（声を出すとバーが動けば拾えています）</label>
+    <div class="meter"><div id="micLevelBar"></div></div>
     <p class="foot" style="text-align:left;margin-top:8px">
-      ※ 音声認識エンジンは OS が選択した入力を使用します。Bluetooth イヤホンを接続すると
-      OS 側で自動的に切り替わります。上の一覧は接続確認用です。
+      ※ バーが全く動かない場合、OS側の既定マイクが別の機器になっています。
+      音声認識エンジンは OS が選択した入力を使用します。Bluetooth イヤホン接続時はOS側で自動的に切り替わります。
     </p>
   </div>
   <div class="warnbox" id="voiceWarn">
@@ -498,6 +509,19 @@ function stripEndKeywords(text, lang){
   return out.replace(/\s+/g," ").trim();
 }
 
+function recogIssue(msg){
+  try{
+    if(ROLE==="master"){ mSetStatus("⚠ "+msg); }
+    else { slaveStatus("⚠️", msg, "Periksa mikrofon", false); }
+  }catch(_){/* 画面未初期化時は無視 */}
+}
+// タブが前面に戻った時、録音セッション中なら認識を強制復帰させる
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState==="visible" && recogActive && !mutedByTTS && !FATAL){
+    setTimeout(()=>{ if(recogActive && !recog) spawnRecognizer(null); }, 300);
+  }
+});
+
 function startRecognition(lang, onStarted){
   if(!SR){ alert("この端末は音声認識(Web Speech API)に対応していません。"); return false; }
   stopRecognition(true);
@@ -536,9 +560,14 @@ function spawnRecognizer(onStarted){
   recog.onerror = e=>{
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){
       recogActive = false;
-      alert("マイクの使用が許可されていません。ブラウザ設定を確認してください。");
+      recogIssue("マイクの使用が許可されていません（ブラウザ設定を確認）");
+    }else if(e.error==="audio-capture"){
+      // マイクが物理的に見つからない/他アプリが専有。再試行は続ける
+      recogIssue("マイクを検出できません（OSの入力デバイス設定を確認）");
+    }else if(e.error==="network"){
+      recogIssue("音声認識サービスに接続できません（通信を確認）");
     }
-    // "no-speech" 等は onend 経由で自動再起動
+    // "no-speech"/"aborted" 等は onend 経由で自動再起動
   };
   try{ recog.start(); }catch(_){}
 }
@@ -624,7 +653,7 @@ function pushHistory(containerId, dir, src, dst){
 /* ============================================================
  * 6. Firebase 同期（cmd / ack / result / hb / fatal）
  * ============================================================ */
-let seq = 0;
+let seq = 0; // 送信時に Date.now() を代入（ページ再読込でも過去より小さくならない）
 let hbTimer = null, hbWatch = null;
 function initFirebase(){
   firebase.initializeApp(CONFIG.FIREBASE);
@@ -693,6 +722,7 @@ function initMaster(){
     const r = snap.val();
     if(!r || !r.dst) return;
     window.__lastResult = r; // 報告フォーム用に直前の結果を保持
+    if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); }
     pushHistory("history", r.dir, r.src, r.dst);
     if(r.dir==="id-ja") enqueueTTS(r.dst, "ja-JP"); // 相手の発話→日本語をマスターで読み上げ
   });
@@ -743,7 +773,7 @@ function initMaster(){
       // ★ACK制御: 即「録音中」にせず、スレーブのマイク起動成功を待つ
       M.state="waitAck"; M.dir="id-ja"; mUpdateButtons();
       mSetStatus("… スレーブ側マイクを起動中");
-      seq++;
+      seq = Date.now();
       roomRef.child("cmd").set({seq, type:"START", dir:"id-ja", ts:Date.now()});
       M.ackTimer = setTimeout(()=>{
         if(M.state==="waitAck"){
@@ -754,15 +784,10 @@ function initMaster(){
     }else if(M.state==="recording" && M.dir==="id-ja"){
       M.state="translating"; mUpdateButtons();
       mSetStatus("… 翻訳中");
-      seq++;
+      seq = Date.now();
       roomRef.child("cmd").set({seq, type:"STOP", dir:"id-ja", ts:Date.now()});
-      // 翻訳完了は result 受信で反映。一定時間後にidleへ復帰。
-      setTimeout(()=>{ if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); } }, 1500);
-      // 状態遷移は result 受信でも解除する
-      const off = roomRef.child("result").on("value", ()=>{ 
-        if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); }
-        roomRef.child("result").off("value", off);
-      });
+      // 翻訳完了は result 受信（下の共通リスナー）で反映。保険として時間経過でも復帰。
+      setTimeout(()=>{ if(M.state==="translating"){ M.state="idle"; M.dir=null; mUpdateButtons(); mSetStatus("待機中"); } }, 6000);
     }
   });
 }
@@ -798,14 +823,37 @@ function slaveStatus(icon, ja, id, listening){
   $("slaveBigStatus").classList.toggle("listening", !!listening);
 }
 
+let meterStream = null, meterRAF = null;
+async function startMicMeter(deviceId){
+  try{
+    if(meterStream) meterStream.getTracks().forEach(t=>t.stop());
+    cancelAnimationFrame(meterRAF);
+    const cons = deviceId ? {audio:{deviceId:{exact:deviceId}}} : {audio:true};
+    meterStream = await navigator.mediaDevices.getUserMedia(cons);
+    const ctx = ensureAudioCtx();
+    const srcNode = ctx.createMediaStreamSource(meterStream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    srcNode.connect(analyser); // destinationには繋がない（音は出さない）
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const bar = $("micLevelBar");
+    (function loop(){
+      analyser.getByteTimeDomainData(buf);
+      let peak = 0;
+      for(let i=0;i<buf.length;i++){ const v = Math.abs(buf[i]-128); if(v>peak) peak=v; }
+      if(bar) bar.style.width = Math.min(100, Math.round(peak/1.28)) + "%";
+      meterRAF = requestAnimationFrame(loop);
+    })();
+  }catch(e){ throw e; }
+}
+
 async function initSlaveSetup(){
   showScreen("scrSlaveSetup");
   // iOS 警告
   if(/iPad|iPhone|iPod/.test(navigator.userAgent)) $("iosWarn").classList.add("show");
-  // マイク権限取得 → デバイス一覧（確認用プルダウン）
+  // マイク権限取得 → デバイス一覧（確認用プルダウン）+ 入力レベルメーター
   try{
-    const st = await navigator.mediaDevices.getUserMedia({audio:true});
-    st.getTracks().forEach(t=>t.stop());
+    await startMicMeter(null);
     const devs = await navigator.mediaDevices.enumerateDevices();
     const sel = $("micSelect");
     sel.innerHTML = "";
@@ -815,6 +863,7 @@ async function initSlaveSetup(){
       o.textContent = d.label || "マイク ("+d.deviceId.slice(0,6)+")";
       sel.appendChild(o);
     });
+    sel.addEventListener("change", ()=>{ startMicMeter(sel.value); });
   }catch(_){
     alert("マイクの使用を許可してください。/ Izinkan penggunaan mikrofon.");
   }
@@ -832,11 +881,8 @@ async function initSlaveSetup(){
     startSilentLoop();      // ★Autoplayブロック回避: 準備完了タップ直後から無音ループ
     playBeep();             // ユーザー操作起点でオーディオ経路を確立
     await keepAwake();
-    // 選択デバイスで keep-alive ストリームを保持（OSの入力ルーティングを誘導）
-    try{
-      const id = $("micSelect").value;
-      if(id) await navigator.mediaDevices.getUserMedia({audio:{deviceId:{exact:id}}});
-    }catch(_){}
+    // メーター用ストリームをそのまま keep-alive として保持（OSの入力ルーティングを誘導）
+    cancelAnimationFrame(meterRAF);
     initSlaveRun();
   }, {once:true});
 }
